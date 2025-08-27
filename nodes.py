@@ -6,6 +6,119 @@ from utils.crawl_github_files import crawl_github_files
 from utils.call_llm import call_llm
 from utils.crawl_local_files import crawl_local_files
 
+import json
+import re
+import yaml
+
+# --- NEW: robust extractor for YAML/JSON from LLM responses ---
+_YAML_FENCE_PATTERNS = [
+    r"```yaml\s*(.*?)```",
+    r"```yml\s*(.*?)```",
+    r"```(?:yaml|yml)?\s*(.*?)```",  # unlabeled fenced block
+]
+_JSON_FENCE_PATTERNS = [
+    r"```json\s*(.*?)```",
+    r"```(?:json)?\s*(\{.*?\})```",  # JSON object fallback
+    r"```(?:json)?\s*(\[.*?\])```",  # JSON array fallback
+]
+
+def _first_match_groups(text: str, patterns):
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+def extract_structured_block(text: str):
+    """
+    Parse a structured payload from LLM output.
+    Priority:
+      1) fenced YAML
+      2) fenced JSON
+      3) whole-response YAML
+      4) whole-response JSON
+    Returns: Python object (list/dict/str).
+    Raises: ValueError on failure.
+    """
+    text = text.strip()
+
+    # 1) fenced YAML
+    code = _first_match_groups(text, _YAML_FENCE_PATTERNS)
+    if code:
+        try:
+            parsed = yaml.safe_load(code)
+            if parsed is not None:
+                return parsed
+        except Exception:
+            pass
+
+    # 2) fenced JSON
+    code = _first_match_groups(text, _JSON_FENCE_PATTERNS)
+    if code:
+        try:
+            parsed = json.loads(code)
+            if parsed is not None:
+                return parsed
+        except Exception:
+            pass
+
+    # 3) whole-response YAML
+    try:
+        parsed = yaml.safe_load(text)
+        if parsed is not None:
+            return parsed
+    except Exception:
+        pass
+
+    # 4) whole-response JSON
+    try:
+        parsed = json.loads(text)
+        if parsed is not None:
+            return parsed
+    except Exception:
+        pass
+
+    preview = text[:500].replace("\n", "\\n")
+    raise ValueError(
+        f"Failed to parse structured content from LLM output. "
+        f"Expect YAML/JSON list or dict. Preview: {preview}"
+    )
+
+# --- NEW: shape normalizer utilities ---
+def _normalize_to_list(obj, *, prefer_keys=("abstractions","items","list","data")):
+    """
+    Given any LLM payload, try to return a list.
+    Accepts:
+      - list -> returned as-is
+      - dict with a known list key -> returns that value
+      - newline-separated string list -> split to list
+      - single item -> wrap in list
+    """
+    if isinstance(obj, list):
+        return obj
+
+    if isinstance(obj, dict):
+        for k in prefer_keys:
+            if k in obj and isinstance(obj[k], list):
+                return obj[k]
+
+    if isinstance(obj, str):
+        # Try YAML of the string
+        try:
+            parsed = yaml.safe_load(obj)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+        # Fallback: split lines if looks like a list of lines
+        lines = [ln.strip() for ln in obj.splitlines() if ln.strip()]
+        if len(lines) >= 1:
+            return lines
+
+    # last resort: wrap single non-list payload in a list
+    return [obj]
+
+
 
 # Helper to get content for specific file indices
 def get_content_for_indices(files_data, indices):
@@ -154,7 +267,7 @@ For each abstraction, provide:
 List of file indices and paths present in the context:
 {file_listing_for_prompt}
 
-Format the output as a YAML list of dictionaries:
+Strictly format the output as a YAML list of dictionaries:
 
 ```yaml
 - name: |
@@ -172,15 +285,25 @@ Format the output as a YAML list of dictionaries:
   file_indices:
     - 5 # path/to/another.js
 # ... up to {max_abstraction_num} abstractions
-```"""
+```
+ (Please respond without emojis.)
+"""
         response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0))  # Use cache only if enabled and not retrying
+        print(response, flush=True)
 
         # --- Validation ---
-        yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
-        abstractions = yaml.safe_load(yaml_str)
+        # yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
+        # abstractions = yaml.safe_load(yaml_str)
 
+        raw_obj = extract_structured_block(response)
+        abstractions = _normalize_to_list(raw_obj)
+
+        # Now we expect a list of dicts with required keys
         if not isinstance(abstractions, list):
-            raise ValueError("LLM Output is not a list")
+            raise ValueError(f"LLM Output after normalization is not a list; got {type(abstractions)}")
+
+        # if not isinstance(abstractions, list):
+        #     raise ValueError("LLM Output is not a list")
 
         validated_abstractions = []
         for item in abstractions:
@@ -251,14 +374,16 @@ class AnalyzeRelationships(Node):
         num_abstractions = len(abstractions)
 
         # Create context with abstraction names, indices, descriptions, and relevant file snippets
-        context = "Identified Abstractions:\\n"
+        # context = "Identified Abstractions:\\n"
+        context = "Identified Abstractions:\n"
         all_relevant_indices = set()
         abstraction_info_for_prompt = []
         for i, abstr in enumerate(abstractions):
             # Use 'files' which contains indices directly
             file_indices_str = ", ".join(map(str, abstr["files"]))
             # Abstraction name and description might be translated already
-            info_line = f"- Index {i}: {abstr['name']} (Relevant file indices: [{file_indices_str}])\\n  Description: {abstr['description']}"
+            # info_line = f"- Index {i}: {abstr['name']} (Relevant file indices: [{file_indices_str}])\\n  Description: {abstr['description']}"
+            info_line = ( f"- Index {i}: {abstr['name']} (Relevant file indices: [{file_indices_str}])\n" f"  Description: {abstr['description']}")
             context += info_line + "\\n"
             abstraction_info_for_prompt.append(
                 f"{i} # {abstr['name']}"
@@ -271,8 +396,12 @@ class AnalyzeRelationships(Node):
             files_data, sorted(list(all_relevant_indices))
         )
         # Format file content for context
-        file_context_str = "\\n\\n".join(
-            f"--- File: {idx_path} ---\\n{content}"
+        # file_context_str = "\\n\\n".join(
+        #     f"--- File: {idx_path} ---\\n{content}"
+        #     for idx_path, content in relevant_files_content_map.items()
+        # )
+        file_context_str = "\n\n".join(
+            f"--- File: {idx_path} ---\n{content}"
             for idx_path, content in relevant_files_content_map.items()
         )
         context += file_context_str
@@ -326,7 +455,7 @@ Context (Abstractions, Descriptions, Code):
 
 IMPORTANT: Make sure EVERY abstraction is involved in at least ONE relationship (either as source or target). Each abstraction index must appear at least once across all relationships.
 
-Format the output as YAML:
+Please output the analysis in strict YAML format:
 
 ```yaml
 summary: |
@@ -341,14 +470,17 @@ relationships:
     label: "Provides config"{lang_hint}
   # ... other relationships
 ```
-
+(Please respond without emojis.)
 Now, provide the YAML output:
 """
         response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0)) # Use cache only if enabled and not retrying
+        print(response, flush=True)
 
         # --- Validation ---
-        yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
-        relationships_data = yaml.safe_load(yaml_str)
+        # yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
+        # relationships_data = yaml.safe_load(yaml_str)
+
+        relationships_data = extract_structured_block(response)
 
         if not isinstance(relationships_data, dict) or not all(
             k in relationships_data for k in ["summary", "relationships"]
@@ -475,7 +607,7 @@ Context about relationships and project summary:
 If you are going to make a tutorial for ```` {project_name} ````, what is the best order to explain these abstractions, from first to last?
 Ideally, first explain those that are the most important or foundational, perhaps user-facing concepts or entry points. Then move to more detailed, lower-level implementation details or supporting concepts.
 
-Output the ordered list of abstraction indices, including the name in a comment for clarity. Use the format `idx # AbstractionName`.
+Output the ordered list of abstraction indices, including the name in a comment for clarity. Use the format `idx # AbstractionName` like shown below.
 
 ```yaml
 - 2 # FoundationalConcept
@@ -483,14 +615,19 @@ Output the ordered list of abstraction indices, including the name in a comment 
 - 1 # CoreClassB (uses CoreClassA)
 - ...
 ```
-
+(Please respond without emojis.)
 Now, provide the YAML output:
 """
         response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0)) # Use cache only if enabled and not retrying
+        print(response, flush=True)
 
         # --- Validation ---
-        yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
-        ordered_indices_raw = yaml.safe_load(yaml_str)
+        # yaml_str = response.strip().split("```yaml")[1].split("```")[0].strip()
+        # ordered_indices_raw = yaml.safe_load(yaml_str)
+
+        ordered_indices_raw = extract_structured_block(response)
+        # Normalize to list (handles {list:[...]} or "0,1,2" styles)
+        ordered_indices_raw = _normalize_to_list(ordered_indices_raw, prefer_keys=("order","indices","list","data"))
 
         if not isinstance(ordered_indices_raw, list):
             raise ValueError("LLM output is not a list")
@@ -721,6 +858,7 @@ Instructions for the chapter (Generate content in {language.capitalize()} unless
 
 - Output *only* the Markdown content for this chapter.
 
+(Please respond without emojis.)
 Now, directly provide a super beginner-friendly Markdown output (DON'T need ```markdown``` tags):
 """
         chapter_content = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0)) # Use cache only if enabled and not retrying
