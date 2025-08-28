@@ -55,14 +55,14 @@ def call_llm(prompt: str, use_cache: bool = True) -> str:
 
     ######## For Gemini ########
     # You can comment the previous line and use the AI Studio key instead:
-    # from google import genai
-    # client = genai.Client(
-    #     api_key=os.getenv("GEMINI_API_KEY", "your-api-key"),
-    # )
-    # model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-    # # model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    # response = client.models.generate_content(model=model, contents=[prompt])
-    # response_text = response.text
+    from google import genai
+    client = genai.Client(
+        api_key=os.getenv("GEMINI_API_KEY", "your-api-key"),
+    )
+    # model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro") # available for paid users only 
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    response = client.models.generate_content(model=model, contents=[prompt])
+    response_text = response.text
 
 
     # ######## For ChatGPT ########
@@ -101,18 +101,18 @@ def call_llm(prompt: str, use_cache: bool = True) -> str:
 
 
     ######## For Deepseek ########
-    from openai import OpenAI
-    client = OpenAI(
-        api_key=os.getenv("DEEPSEEK_API_KEY", "your-api-key"),
-        base_url="https://api.deepseek.com"
-    )
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=8192
-    )
-    response_text = response.choices[0].message.content
+    # from openai import OpenAI
+    # client = OpenAI(
+    #     api_key=os.getenv("DEEPSEEK_API_KEY", "your-api-key"),
+    #     base_url="https://api.deepseek.com"
+    # )
+    # model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    # response = client.chat.completions.create(
+    #     model=model,
+    #     messages=[{"role": "user", "content": prompt}],
+    #     max_tokens=8192
+    # )
+    # response_text = response.choices[0].message.content
 
 
 
